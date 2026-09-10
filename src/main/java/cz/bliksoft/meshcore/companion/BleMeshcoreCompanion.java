@@ -208,7 +208,7 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 		// real error
 		// if it truly can't connect.
 		try {
-			newAdapter.scan(new ScanFilter(), SCAN_TIMEOUT_MS, (address, name, rssi) -> {
+			newAdapter.scan(new ScanFilter().withServiceUuid(NUS_SERVICE), SCAN_TIMEOUT_MS, (address, name, rssi) -> {
 			});
 		} catch (BleException e) {
 			throw new IOException("BLE scan failed", e);
@@ -345,9 +345,9 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	// ─── Utility: scanning ────────────────────────────────────────────────────
 
 	/**
-	 * Scan for BLE devices and return a list of "address (name)" strings for all
-	 * visible peripherals. Use this to discover the address to pass to the
-	 * constructor.
+	 * Scan for BLE devices advertising {@link #NUS_SERVICE} and return a list of
+	 * "address (name)" strings, filtering out unrelated nearby BLE devices. Use
+	 * this to discover the address to pass to the constructor.
 	 *
 	 * @param timeoutMs scan duration in milliseconds
 	 * @return list of "address (name)" strings for each discovered peripheral
@@ -361,7 +361,7 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 			// to a
 			// real one if a later advertisement carries it, without ever downgrading back.
 			Map<String, String> devices = new LinkedHashMap<>();
-			adapter.scan(new ScanFilter(), timeoutMs, (address, name, rssi) -> {
+			adapter.scan(new ScanFilter().withServiceUuid(NUS_SERVICE), timeoutMs, (address, name, rssi) -> {
 				if ((name != null && !name.trim().isEmpty()) || !devices.containsKey(address)) {
 					devices.put(address, name);
 				}
