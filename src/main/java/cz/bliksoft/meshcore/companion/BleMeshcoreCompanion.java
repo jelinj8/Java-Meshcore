@@ -15,6 +15,8 @@ import java.util.logging.Logger;
 import cz.bliksoft.javautils.ble.BleAdapter;
 import cz.bliksoft.javautils.ble.BleException;
 import cz.bliksoft.javautils.ble.BlePeripheral;
+import cz.bliksoft.javautils.ble.ConnectionParameterPreset;
+import cz.bliksoft.javautils.ble.ConnectionParameters;
 import cz.bliksoft.javautils.ble.ScanFilter;
 
 /**
@@ -255,6 +257,74 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	protected void onDeviceConnected() {
 		super.onDeviceConnected();
 		log.info(String.format("BLE connected to %s", deviceAddress));
+		logConnectionDiagnostics();
+	}
+
+	/**
+	 * Logs adapter/connection-quality diagnostics at INFO once per connect - backend support for
+	 * these varies by platform (confirmed on Windows; see {@link BlePeripheral}'s own docs), so
+	 * failures here are expected on some platforms and logged at FINE rather than surfaced.
+	 */
+	private void logConnectionDiagnostics() {
+		BleAdapter a = adapter;
+		BlePeripheral p = peripheral;
+		if (a == null || p == null)
+			return;
+		try {
+			log.info("BLE adapter state: " + a.getAdapterState());
+		} catch (BleException e) {
+			log.log(Level.FINE, "adapter state query failed/unsupported", e);
+		}
+		try {
+			log.info("BLE MTU: " + p.getMtu() + " bytes");
+		} catch (BleException e) {
+			log.log(Level.FINE, "MTU query failed/unsupported", e);
+		}
+		try {
+			log.info("BLE RSSI: " + p.readRssi() + " dBm");
+		} catch (BleException e) {
+			log.log(Level.FINE, "RSSI query failed/unsupported", e);
+		}
+		try {
+			ConnectionParameters params = p.getConnectionParameters();
+			log.info("BLE connection parameters: " + (params != null ? params : "not exposed on this platform"));
+		} catch (BleException e) {
+			log.log(Level.FINE, "connection parameters query failed/unsupported", e);
+		}
+	}
+
+	/**
+	 * Requests a connection-parameter preset from the OS - e.g.
+	 * {@link ConnectionParameterPreset#THROUGHPUT_OPTIMIZED} before a bulk message sync, switched
+	 * back to {@link ConnectionParameterPreset#BALANCED} afterward. Best-effort and advisory (the
+	 * radio may accept or reject it - read {@link #getConnectionParameters()} afterward to see
+	 * what actually took effect); silently no-ops rather than throwing if unsupported on this
+	 * platform or not currently connected, so callers don't need to special-case that.
+	 */
+	public void requestConnectionParameters(ConnectionParameterPreset preset) {
+		BlePeripheral p = peripheral;
+		if (p == null)
+			return;
+		try {
+			p.requestConnectionParameters(preset);
+		} catch (BleException e) {
+			log.log(Level.FINE, "connection parameter request failed/unsupported", e);
+		}
+	}
+
+	/**
+	 * Current BLE connection parameters as reported by the OS, or {@code null} if unsupported on
+	 * this platform or not currently connected.
+	 */
+	public ConnectionParameters getConnectionParameters() {
+		BlePeripheral p = peripheral;
+		if (p == null)
+			return null;
+		try {
+			return p.getConnectionParameters();
+		} catch (BleException e) {
+			return null;
+		}
 	}
 
 	@Override

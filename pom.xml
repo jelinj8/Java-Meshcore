@@ -57,13 +57,17 @@
 			Provided scope: required only when using BLE; not needed for serial-only usage.
 			Drives BLE through a bundled Rust sidecar process rather than an in-process native
 			binding, so a native-side BLE fault can't crash the JVM (see
-			https://github.com/jelinj8/Java-BSToolbox-BLE for why). Pinned to the Maven Central
-			release; pre-release snapshot builds are published to Forgejo's Maven package registry.
+			https://github.com/jelinj8/Java-BSToolbox-BLE for why). Pinned to a local 0.3.0-SNAPSHOT
+			install (not the published 0.2.0) while BSToolbox-BLE's Windows scan/discovery fixes and
+			connection-quality API (getMtu/readRssi/getConnectionParameters/
+			requestConnectionParameters/getAdapterState) are still unreleased - install it locally
+			first: `cd ../BSToolbox-BLE && mvn install` (or the deploy-maven-local skill). Move back
+			to a published release once those ship.
 		-->
 		<dependency>
 			<groupId>cz.bliksoft.java</groupId>
 			<artifactId>common-java-utils-ble</artifactId>
-			<version>0.2.0</version>
+			<version>0.3.0-SNAPSHOT</version>
 			<scope>provided</scope>
 		</dependency>
 
