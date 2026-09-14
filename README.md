@@ -1,5 +1,5 @@
 This is an implementation of the [MeshCore companion serial interface](https://github.com/meshcore-dev/MeshCore/tree/main/examples/companion_radio). It allows full control of the companion (all communication frame types are implemented) currently via USB.
-Firmware compatibility v1.15.0 (including multibyte routing).
+Implements companion protocol version `FIRMWARE_VER_CODE=13`, unchanged from firmware v1.16.0 through v1.17.1 (including multibyte routing).
 
 Initial version was written by me (reverse-engineering of the C++ firmware source), later with help from AI (mainly sanity checking, decryption, cleanup and mechanical tasks). Now I'm using it to keep in sync with firmware updates. Fortunately the AI still needs someone who knows what they want and directs it, but it is gaining traction.
 
@@ -19,7 +19,7 @@ Both transport dependencies are `provided` — add only the one(s) you use to yo
 <dependency>
     <groupId>com.fazecast</groupId>
     <artifactId>jSerialComm</artifactId>
-    <version>[2.0.0,3.0.0)</version>
+    <version>2.11.4</version>
 </dependency>
 ```
 
@@ -28,7 +28,7 @@ Both transport dependencies are `provided` — add only the one(s) you use to yo
 <dependency>
     <groupId>cz.bliksoft.java</groupId>
     <artifactId>common-java-utils-ble</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.5.0</version>
 </dependency>
 ```
 
