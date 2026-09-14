@@ -4,7 +4,9 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -23,6 +25,27 @@ public class SerialMeshcoreCompanion extends MeshcoreCompanion {
 	private volatile OutputStream out;
 
 	private volatile SerialPort port;
+
+	/**
+	 * Lists available serial ports as {@code "SYSTEM_NAME – Descriptive Name"}
+	 * strings, so a caller can present a picker without depending on jSerialComm
+	 * ({@link SerialPort}) directly - matches {@link BleMeshcoreCompanion}'s own
+	 * {@code "address (name)"} scan-result format for the same reason: this
+	 * Meshcore library is meant to stay usable (e.g. TCP-only) without forcing a
+	 * transport-specific dependency on every consumer. Split on {@code " – "} (an
+	 * en dash, not a hyphen) to recover the system port name to pass to the
+	 * constructor.
+	 *
+	 * @return list of "SYSTEM_NAME – Descriptive Name" strings, one per port
+	 */
+	public static List<String> listPorts() {
+		SerialPort[] ports = SerialPort.getCommPorts();
+		List<String> result = new ArrayList<>(ports.length);
+		for (SerialPort p : ports) {
+			result.add(p.getSystemPortName() + " – " + p.getDescriptivePortName());
+		}
+		return result;
+	}
 
 	public SerialMeshcoreCompanion(String name, String portName, int baud) throws IOException {
 		super(name);

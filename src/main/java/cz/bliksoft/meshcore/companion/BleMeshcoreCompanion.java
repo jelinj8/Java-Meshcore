@@ -3,9 +3,7 @@ package cz.bliksoft.meshcore.companion;
 import java.io.EOFException;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -18,6 +16,7 @@ import cz.bliksoft.javautils.ble.BlePeripheral;
 import cz.bliksoft.javautils.ble.ConnectionParameterPreset;
 import cz.bliksoft.javautils.ble.ConnectionParameters;
 import cz.bliksoft.javautils.ble.ScanFilter;
+import cz.bliksoft.javautils.ble.utils.BleUtils;
 
 /**
  * BLE transport for MeshcoreCompanion using the Nordic UART Service (NUS). Uses
@@ -79,6 +78,10 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	private volatile BleAdapter adapter;
 	private volatile BlePeripheral peripheral;
 
+	// Set only by the BleAdapter-accepting constructor, and consumed (nulled) the
+	// first time connectBle() runs - see that constructor's doc.
+	private volatile BleAdapter initialAdapter;
+
 	// Each queued entry is already one complete frame - see the class-level note on
 	// BLE framing.
 	private final LinkedBlockingQueue<byte[]> rxChunks = new LinkedBlockingQueue<>();
@@ -94,6 +97,37 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	public BleMeshcoreCompanion(String name, String deviceAddress) {
 		super(name);
 		this.deviceAddress = Objects.requireNonNull(deviceAddress, "deviceAddress");
+		startLoop();
+	}
+
+	/**
+	 * Creates a companion that connects to a MeshCore radio over BLE and
+	 * immediately starts the reader loop, reusing {@code adapter} for the very
+	 * first connect attempt instead of opening a new sidecar process and
+	 * re-scanning for an address the caller already found - e.g. right after an
+	 * interactive discovery scan on that same adapter (see
+	 * {@link #scanForNusDevices(BleAdapter, int)}). {@code adapter} must have
+	 * already discovered {@code deviceAddress} via a scan on itself - a peripheral
+	 * is only connectable on the adapter that scanned for it (see
+	 * {@link BleAdapter}'s own class doc). Ownership of {@code adapter} transfers
+	 * to this companion, which closes it like any other adapter it creates.
+	 *
+	 * <p>
+	 * Only the first connect attempt reuses {@code adapter} this way - if the
+	 * connection later drops, subsequent automatic reconnects fall back to opening
+	 * a fresh sidecar process and scanning again, exactly like
+	 * {@link #BleMeshcoreCompanion(String, String)} always does.
+	 *
+	 * @param name          companion name (for logging/identity)
+	 * @param deviceAddress BLE MAC address of the MeshCore radio, already
+	 *                      discovered via a scan on {@code adapter}
+	 * @param adapter       an adapter that has already scanned for
+	 *                      {@code deviceAddress}; ownership transfers here
+	 */
+	public BleMeshcoreCompanion(String name, String deviceAddress, BleAdapter adapter) {
+		super(name);
+		this.deviceAddress = Objects.requireNonNull(deviceAddress, "deviceAddress");
+		this.initialAdapter = Objects.requireNonNull(adapter, "adapter");
 		startLoop();
 	}
 
@@ -181,37 +215,51 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	private void connectBle() throws IOException {
 		rxChunks.clear();
 
-		// Every reconnect attempt gets a fresh sidecar process, so a crashed sidecar
-		// from a
-		// previous attempt is simply retried like any other disconnect — no restart
-		// bookkeeping
-		// needed here.
-		BleAdapter newAdapter;
-		try {
-			newAdapter = new BleAdapter();
-		} catch (BleException e) {
-			throw new IOException("Failed to start BLE sidecar", e);
+		// A caller-supplied, already-scanned adapter (see the BleAdapter-accepting
+		// constructor) is only ever used for this very first connect attempt - null it
+		// out immediately so a later reconnect (after a disconnect) falls back to the
+		// normal fresh-sidecar-plus-scan path below, exactly like the plain
+		// (name, address) constructor always does.
+		BleAdapter newAdapter = initialAdapter;
+		initialAdapter = null;
+		boolean alreadyScanned = newAdapter != null;
+
+		if (newAdapter == null) {
+			// Every reconnect attempt gets a fresh sidecar process, so a crashed sidecar
+			// from a
+			// previous attempt is simply retried like any other disconnect — no restart
+			// bookkeeping
+			// needed here.
+			try {
+				newAdapter = new BleAdapter();
+			} catch (BleException e) {
+				throw new IOException("Failed to start BLE sidecar", e);
+			}
 		}
 		this.adapter = newAdapter;
 
-		// A scan is required before connect() - some BSToolbox-BLE backends only learn
-		// about a
-		// peripheral (even an already-bonded one) through an active scan, and reject
-		// connect()
-		// against an address they've never scanned. The scan's own device_found
-		// callback isn't
-		// used to gate connect() below, though: a bonded device doesn't reliably
-		// re-announce
-		// itself within the scan window on every backend, so a missed callback here
-		// isn't
-		// reliable evidence the device is unreachable - connect() itself reports the
-		// real error
-		// if it truly can't connect.
-		try {
-			newAdapter.scan(new ScanFilter().withServiceUuid(NUS_SERVICE), SCAN_TIMEOUT_MS, (address, name, rssi) -> {
-			});
-		} catch (BleException e) {
-			throw new IOException("BLE scan failed", e);
+		if (!alreadyScanned) {
+			// A scan is required before connect() - some BSToolbox-BLE backends only learn
+			// about a
+			// peripheral (even an already-bonded one) through an active scan, and reject
+			// connect()
+			// against an address they've never scanned. We already know the exact address
+			// we're
+			// reconnecting to, so ScanFilter.withAddress() makes the adapter stop the scan
+			// as soon
+			// as that address is seen instead of always burning the full SCAN_TIMEOUT_MS -
+			// a missed
+			// advertisement here just falls through to the timeout, it isn't treated as
+			// proof the
+			// device is unreachable; connect() itself reports the real error if it truly
+			// can't
+			// connect.
+			try {
+				BleUtils.scan(newAdapter, new ScanFilter().withServiceUuid(NUS_SERVICE).withAddress(deviceAddress),
+						SCAN_TIMEOUT_MS);
+			} catch (BleException e) {
+				throw new IOException("BLE scan failed", e);
+			}
 		}
 
 		BlePeripheral p = newAdapter.getPeripheral(deviceAddress);
@@ -220,6 +268,12 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 
 		try {
 			p.connect();
+			// On Windows, subscribe() goes through win_gatt.rs, which - unlike the
+			// Linux/macOS path - has no internal retry loop to implicitly (re)discover
+			// services if they aren't cached yet right after connecting; without this
+			// explicit call, subscribe() below can fail on a freshly (re)connected
+			// peripheral until something else happens to warm the OS's GATT cache first.
+			p.discoverServices();
 		} catch (BleException e) {
 			throw new IOException("BLE connect failed to " + deviceAddress + PAIRING_HINT, e);
 		}
@@ -261,9 +315,10 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	}
 
 	/**
-	 * Logs adapter/connection-quality diagnostics at INFO once per connect - backend support for
-	 * these varies by platform (confirmed on Windows; see {@link BlePeripheral}'s own docs), so
-	 * failures here are expected on some platforms and logged at FINE rather than surfaced.
+	 * Logs adapter/connection-quality diagnostics at INFO once per connect -
+	 * backend support for these varies by platform (confirmed on Windows; see
+	 * {@link BlePeripheral}'s own docs), so failures here are expected on some
+	 * platforms and logged at FINE rather than surfaced.
 	 */
 	private void logConnectionDiagnostics() {
 		BleAdapter a = adapter;
@@ -295,11 +350,12 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 
 	/**
 	 * Requests a connection-parameter preset from the OS - e.g.
-	 * {@link ConnectionParameterPreset#THROUGHPUT_OPTIMIZED} before a bulk message sync, switched
-	 * back to {@link ConnectionParameterPreset#BALANCED} afterward. Best-effort and advisory (the
-	 * radio may accept or reject it - read {@link #getConnectionParameters()} afterward to see
-	 * what actually took effect); silently no-ops rather than throwing if unsupported on this
-	 * platform or not currently connected, so callers don't need to special-case that.
+	 * {@link ConnectionParameterPreset#THROUGHPUT_OPTIMIZED} before a bulk message
+	 * sync, switched back to {@link ConnectionParameterPreset#BALANCED} afterward.
+	 * Best-effort and advisory (the radio may accept or reject it - read
+	 * {@link #getConnectionParameters()} afterward to see what actually took
+	 * effect); silently no-ops rather than throwing if unsupported on this platform
+	 * or not currently connected, so callers don't need to special-case that.
 	 */
 	public void requestConnectionParameters(ConnectionParameterPreset preset) {
 		BlePeripheral p = peripheral;
@@ -313,8 +369,8 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	}
 
 	/**
-	 * Current BLE connection parameters as reported by the OS, or {@code null} if unsupported on
-	 * this platform or not currently connected.
+	 * Current BLE connection parameters as reported by the OS, or {@code null} if
+	 * unsupported on this platform or not currently connected.
 	 */
 	public ConnectionParameters getConnectionParameters() {
 		BlePeripheral p = peripheral;
@@ -331,7 +387,9 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	protected void onDeviceDisconnected(Exception cause) {
 		super.onDeviceDisconnected(cause);
 		if (cause instanceof IOException)
-			log.warning(String.format("BLE disconnected from %s: %s", deviceAddress, cause));
+			// Attach cause (not just its message) so the wrapped BleException's own detail
+			// - e.g. the actual native error behind "Failed to subscribe..." - isn't lost.
+			log.log(Level.WARNING, String.format("BLE disconnected from %s: %s", deviceAddress, cause), cause);
 		else
 			log.log(Level.SEVERE, "BLE communication error", cause);
 	}
@@ -349,30 +407,131 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	 * "address (name)" strings, filtering out unrelated nearby BLE devices. Use
 	 * this to discover the address to pass to the constructor.
 	 *
+	 * <p>
+	 * Opens (and closes) a temporary adapter just for this scan. If the caller
+	 * intends to connect to whichever device is picked from the result afterward,
+	 * prefer {@link #scanForNusDevices(BleAdapter, int)} plus
+	 * {@link #BleMeshcoreCompanion(String, String, BleAdapter)} instead, so that
+	 * connect doesn't have to open a second adapter and re-scan for an address this
+	 * call already found.
+	 *
 	 * @param timeoutMs scan duration in milliseconds
 	 * @return list of "address (name)" strings for each discovered peripheral
 	 * @throws IOException if no adapter found or scan fails
 	 */
 	public static List<String> scanForNusDevices(int timeoutMs) throws IOException {
 		try (BleAdapter adapter = new BleAdapter()) {
-			// A device readvertises repeatedly during the scan window, so the same address
-			// shows
-			// up in many events - keyed map dedupes by address, upgrading a null/blank name
-			// to a
-			// real one if a later advertisement carries it, without ever downgrading back.
-			Map<String, String> devices = new LinkedHashMap<>();
-			adapter.scan(new ScanFilter().withServiceUuid(NUS_SERVICE), timeoutMs, (address, name, rssi) -> {
-				if ((name != null && !name.trim().isEmpty()) || !devices.containsKey(address)) {
-					devices.put(address, name);
-				}
-			});
+			return scanForNusDevices(adapter, timeoutMs);
+		} catch (BleException e) {
+			throw new IOException("Failed to start BLE sidecar", e);
+		}
+	}
+
+	/**
+	 * Same as {@link #scanForNusDevices(int)}, but scans on a caller-supplied
+	 * {@code adapter} instead of opening (and closing) a temporary one - not closed
+	 * by this method. Pass the same {@code adapter} to
+	 * {@link #BleMeshcoreCompanion(String, String, BleAdapter)} to connect to
+	 * whichever address is picked from the result without a second, redundant scan;
+	 * close {@code adapter} yourself if it ends up unused (e.g. the user cancels a
+	 * device picker).
+	 *
+	 * @param adapter   the adapter to scan on
+	 * @param timeoutMs scan duration in milliseconds
+	 * @return list of "address (name)" strings for each discovered peripheral
+	 * @throws IOException if the scan fails
+	 */
+	public static List<String> scanForNusDevices(BleAdapter adapter, int timeoutMs) throws IOException {
+		try {
+			// BleUtils.scan already dedupes by address, preferring a result with a non-null
+			// name
+			// over one without, across the repeated advertisements a device sends during
+			// the
+			// scan
+			// window.
+			List<BleUtils.BleDeviceResult> devices = BleUtils.scan(adapter,
+					new ScanFilter().withServiceUuid(NUS_SERVICE), timeoutMs);
 			List<String> result = new ArrayList<>();
-			for (Map.Entry<String, String> e : devices.entrySet()) {
-				result.add(e.getKey() + " (" + (e.getValue() != null ? e.getValue() : "") + ")");
+			for (BleUtils.BleDeviceResult device : devices) {
+				result.add(device.getAddress() + " (" + (device.getName() != null ? device.getName() : "") + ")");
 			}
 			return result;
 		} catch (BleException e) {
 			throw new IOException("BLE scan failed", e);
+		}
+	}
+
+	/**
+	 * Scans for NUS devices and returns a handle bundling the results with the
+	 * adapter that found them, so a caller who lets the user pick one to connect to
+	 * can do so via {@link NusScanResult#connect} - without a second, redundant
+	 * scan, and without needing to reference {@link BleAdapter} (or any other
+	 * BSToolbox-BLE type) directly. That matters for a caller that wants to depend
+	 * only on this Meshcore library and not directly on BSToolbox-BLE - e.g. an
+	 * application that otherwise only uses the TCP/Serial transports and only
+	 * touches BLE-specific types through this class.
+	 *
+	 * @param timeoutMs scan duration in milliseconds
+	 * @return the scan results plus a handle to connect (or close) with
+	 * @throws IOException if no adapter found or scan fails
+	 */
+	public static NusScanResult scanForNusDevicesKeepingAdapter(int timeoutMs) throws IOException {
+		BleAdapter adapter;
+		try {
+			adapter = new BleAdapter();
+		} catch (BleException e) {
+			throw new IOException("Failed to start BLE sidecar", e);
+		}
+		try {
+			return new NusScanResult(adapter, scanForNusDevices(adapter, timeoutMs));
+		} catch (IOException e) {
+			adapter.close();
+			throw e;
+		}
+	}
+
+	/**
+	 * Bundles a {@link #scanForNusDevicesKeepingAdapter} result with the adapter
+	 * that produced it. Exactly one of {@link #connect} or {@link #close} should
+	 * eventually be called: {@link #connect} takes over the adapter (the returned
+	 * companion closes it like any other it owns); {@link #close} closes it
+	 * directly, for when the scan result ends up unused (e.g. the user cancels a
+	 * device picker). Calling {@link #close} after {@link #connect} is harmless - a
+	 * no-op, since the companion already owns the adapter by then.
+	 */
+	public static final class NusScanResult implements AutoCloseable {
+		private final BleAdapter adapter;
+		private final List<String> devices;
+		private volatile boolean adopted;
+
+		private NusScanResult(BleAdapter adapter, List<String> devices) {
+			this.adapter = adapter;
+			this.devices = devices;
+		}
+
+		/**
+		 * "address (name)" strings for each discovered peripheral - see
+		 * {@link BleMeshcoreCompanion#scanForNusDevices(int)}.
+		 */
+		public List<String> getDevices() {
+			return devices;
+		}
+
+		/**
+		 * Connects to {@code address} (one of {@link #getDevices}'s addresses) using
+		 * the same adapter this scan ran on - no re-scan. Ownership of the adapter
+		 * transfers to the returned companion; {@link #close} on this result becomes a
+		 * no-op afterward.
+		 */
+		public BleMeshcoreCompanion connect(String name, String address) {
+			adopted = true;
+			return new BleMeshcoreCompanion(name, address, adapter);
+		}
+
+		@Override
+		public void close() {
+			if (!adopted)
+				adapter.close();
 		}
 	}
 }
