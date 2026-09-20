@@ -28,7 +28,7 @@ Both transport dependencies are `provided` — add only the one(s) you use to yo
 <dependency>
     <groupId>cz.bliksoft.java</groupId>
     <artifactId>common-java-utils-ble</artifactId>
-    <version>0.5.0</version>
+    <version>0.7.0</version>
 </dependency>
 ```
 
@@ -56,7 +56,9 @@ companion.close();
 
 `BleMeshcoreCompanion` expects the radio firmware to expose the [Nordic UART Service](https://developer.nordicsemi.com/nRF_Connect_SDK/doc/latest/nrf/libraries/bluetooth_services/services/nus.html) (NUS). The UUIDs used are the standard ones (`6E400001...` / TX `6E400002...` / RX `6E400003...`) — confirmed against the [firmware's own BLE companion protocol docs](https://github.com/meshcore-dev/MeshCore/wiki/Companion-Radio-Protocol).
 
-**Pairing:** companion_radio's BLE GATT is configured with MITM protection and mandatory bonding on both ESP32 and NRF52 builds, using a static PIN (`123456` by default). Pair the device via your OS's Bluetooth settings *before* connecting — this library has no way to drive the OS pairing flow itself. Connecting to an unpaired device that requires bonding fails with a clear authentication error rather than hanging silently.
+**Pairing:** companion_radio's BLE GATT is configured with MITM protection and mandatory bonding on both ESP32 and NRF52 builds, using a static PIN (`123456` by default, exposed as `BleMeshcoreCompanion.DEFAULT_BLE_PIN`). `BleMeshcoreCompanion` now pairs automatically — no manual OS Bluetooth-settings step needed on Windows or Linux. The PIN is only needed once, on the very first connection to a freshly scanned device (`new BleMeshcoreCompanion(name, address, adapter)`, or the default two-arg `(name, address)` constructor, both use `DEFAULT_BLE_PIN`; pass a custom PIN via the 4-arg constructor, or `null`/blank to skip pairing entirely). A later reconnect to an already-bonded device needs no PIN at all, since the OS keeps the bond across reconnects.
+
+**macOS:** pairing cannot be triggered programmatically at all — the underlying `BSToolbox-BLE` library's `pair()` fails immediately on macOS, since CoreBluetooth has no public API for supplying a pairing PIN (a permanent Apple platform restriction, not a bug here or in `BleMeshcoreCompanion`). On macOS, pair the device manually through the OS's own Bluetooth settings before connecting, same as before this feature existed.
 
 **Known issue on Windows:** BLE pairing and GATT operations against MeshCore devices have been unreliable on Windows in testing (hangs after pairing, and pairing two MeshCore devices to the same PC at once can break BLE for both) — not reproducible on Linux/BlueZ so far. If BLE is flaky, try Linux before assuming a bug in this library.
 
