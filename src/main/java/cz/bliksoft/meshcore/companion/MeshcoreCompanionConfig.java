@@ -507,7 +507,7 @@ public class MeshcoreCompanionConfig {
 	public void syncChannels() throws IOException, TimeoutException, InterruptedException {
 		channels = new HashMap<>();
 		for (int i = 0; i < getMaxGroupChannels(); i++) {
-			ResponseFrame resp = companion.sendFrameWithResult(new CmdGetChannel(i), 1000);
+			ResponseFrame resp = companion.sendFrameWithResult(new CmdGetChannel(i), defaultGetTimeout);
 			if (resp instanceof ChannelInfo) {
 				ChannelInfo chI = (ChannelInfo) resp;
 				if (chI.getName().length() > 0) {
@@ -528,7 +528,7 @@ public class MeshcoreCompanionConfig {
 	 * @throws InterruptedException if the calling thread is interrupted
 	 */
 	public void syncChannel(int id) throws IOException, TimeoutException, InterruptedException {
-		ResponseFrame resp = companion.sendFrameWithResult(new CmdGetChannel(id), 1000);
+		ResponseFrame resp = companion.sendFrameWithResult(new CmdGetChannel(id), defaultGetTimeout);
 		if (resp instanceof ChannelInfo) {
 			ChannelInfo chI = (ChannelInfo) resp;
 			if (chI.getName().length() > 0) {
@@ -560,9 +560,11 @@ public class MeshcoreCompanionConfig {
 								existing.getId(), name, id));
 		}
 		CmdSetChannel cmd = new CmdSetChannel(id, name, (name != null ? key : new byte[16]));
-		ResponseFrame cmdResp = companion.sendFrameWithResult(cmd, 1000);
+		// the device persists the channel to flash before answering - over BLE that has
+		// been observed to take ~1.2 s
+		ResponseFrame cmdResp = companion.sendFrameWithResult(cmd, 5000);
 		if (cmdResp instanceof Ok) {
-			ResponseFrame resp = companion.sendFrameWithResult(new CmdGetChannel(id), 1000);
+			ResponseFrame resp = companion.sendFrameWithResult(new CmdGetChannel(id), defaultGetTimeout);
 			if (resp instanceof ChannelInfo) {
 				ChannelInfo chI = (ChannelInfo) resp;
 				if (chI.getName().length() > 0) {
