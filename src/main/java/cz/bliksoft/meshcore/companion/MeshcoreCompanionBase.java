@@ -1,6 +1,7 @@
 package cz.bliksoft.meshcore.companion;
 
 import java.io.Closeable;
+import java.io.File;
 import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -19,11 +20,13 @@ import java.util.logging.Logger;
 
 import cz.bliksoft.meshcore.frames.CommandFrame;
 import cz.bliksoft.meshcore.frames.Frame;
+import cz.bliksoft.meshcore.frames.FrameConstants.ResponseFrameType;
 import cz.bliksoft.meshcore.frames.ResponseFrame;
 import cz.bliksoft.meshcore.frames.cmd.CmdAppStart;
 import cz.bliksoft.meshcore.frames.cmd.CmdDeviceQuery;
 import cz.bliksoft.meshcore.frames.resp.DeviceInfo;
 import cz.bliksoft.meshcore.frames.resp.SelfInfo;
+import cz.bliksoft.meshcore.utils.MeshcoreUtils;
 
 /**
  * Abstract base for MeshCore companion device connections.
@@ -69,6 +72,78 @@ public abstract class MeshcoreCompanionBase implements Closeable {
 
 	public MeshcoreCompanionBase(String name) {
 		this.name = name;
+		this.trafficLogDir = defaultTrafficLogDir;
+	}
+
+	private static volatile File defaultTrafficLogDir = null;
+	private volatile File trafficLogDir;
+
+	/**
+	 * Sets the traffic log folder for companions created from now on (see
+	 * {@link #setTrafficLogDir(File)}); {@code null} disables. Transport
+	 * constructors start talking to the device right away, so this is the way to
+	 * capture the initial handshake as well. Existing companions are not affected.
+	 *
+	 * @param dir target folder, or {@code null}
+	 */
+	public static void setDefaultTrafficLogDir(File dir) {
+		defaultTrafficLogDir = dir;
+	}
+
+	/**
+	 * @return the traffic log folder for newly created companions, or {@code null}
+	 */
+	public static File getDefaultTrafficLogDir() {
+		return defaultTrafficLogDir;
+	}
+
+	/**
+	 * Enables traffic logging: every frame sent to / received from the device is
+	 * written to {@code dir} as {@code <timestamp>-<device>-<frameType>-req.json}
+	 * (commands), {@code ...-resp.json} (responses) or {@code ...-evt.json}
+	 * (pushes), {@code device} being {@link #getDeviceId()}. The folder is created
+	 * on demand. {@code null} disables. Initialized from
+	 * {@link #setDefaultTrafficLogDir(File)}.
+	 *
+	 * @param dir target folder, or {@code null}
+	 */
+	public void setTrafficLogDir(File dir) {
+		this.trafficLogDir = dir;
+	}
+
+	/**
+	 * @return the current traffic log folder, or {@code null} when disabled
+	 */
+	public File getTrafficLogDir() {
+		return trafficLogDir;
+	}
+
+	/**
+	 * Transport-level identification of the device (serial port, {@code host:port},
+	 * BLE address), used e.g. in traffic log file names.
+	 *
+	 * @return device identifier, defaults to {@link #getName()}
+	 */
+	public String getDeviceId() {
+		return getName();
+	}
+
+	private void logSentFrame(Frame payload, byte[] bytes) {
+		File dir = trafficLogDir;
+		if (dir == null)
+			return;
+		String type = payload instanceof CommandFrame ? String.valueOf(((CommandFrame) payload).getFrameType())
+				: payload.getClass().getSimpleName();
+		FrameTrafficLog.write(dir, getDeviceId(), type, "req", payload, bytes);
+	}
+
+	private void logReceivedFrame(ResponseFrame frame, byte[] data) {
+		File dir = trafficLogDir;
+		if (dir == null || data == null || data.length == 0)
+			return;
+		ResponseFrameType ft = frame == null ? null : frame.getFrameType();
+		String type = ft != null ? ft.name() : "UNKNOWN_" + MeshcoreUtils.hex(data[0]);
+		FrameTrafficLog.write(dir, getDeviceId(), type, (data[0] & 0xFF) < 128 ? "resp" : "evt", frame, data);
 	}
 
 	private static Logger log = Logger.getLogger(MeshcoreCompanionBase.class.getName());
@@ -171,11 +246,13 @@ public abstract class MeshcoreCompanionBase implements Closeable {
 	 * @throws IOException if the underlying transport reports an error
 	 */
 	public void sendFrame(Frame payload) throws IOException {
-		requestLock.lock();
 		if (frameLog.isLoggable(Level.FINE))
 			frameLog.fine(payload.toString());
+		byte[] bytes = payload.getBytes();
+		requestLock.lock();
 		try {
-			sendBinaryFrame(payload.getBytes());
+			logSentFrame(payload, bytes);
+			sendBinaryFrame(bytes);
 		} finally {
 			requestLock.unlock();
 		}
@@ -215,9 +292,9 @@ public abstract class MeshcoreCompanionBase implements Closeable {
 	public ResponseFrame sendFrameWithResult(CommandFrame payload, long timeoutMs, byte... acceptCodes)
 			throws IOException, TimeoutException, InterruptedException {
 		checkBlockingThread();
-		requestLock.lock();
 		if (frameLog.isLoggable(Level.FINE))
 			frameLog.fine(payload.toString());
+		requestLock.lock();
 		try {
 			CompletableFuture<ResponseFrame> f = new CompletableFuture<>();
 			pendingFuture = f;
@@ -226,7 +303,9 @@ public abstract class MeshcoreCompanionBase implements Closeable {
 						"Frame does not specify any expected ResponseFrameTypes, can't wait for response. Use sendFrame.");
 
 			pendingAcceptCodes = acceptCodes;
-			sendBinaryFrame(payload.getBytes());
+			byte[] bytes = payload.getBytes();
+			logSentFrame(payload, bytes);
+			sendBinaryFrame(bytes);
 			return getFuture(f, timeoutMs);
 		} finally {
 			pendingFuture = null;
@@ -518,7 +597,14 @@ public abstract class MeshcoreCompanionBase implements Closeable {
 	 * @throws IOException if dispatch fails
 	 */
 	protected void dispatchFrame(byte[] data) throws IOException {
-		ResponseFrame f = (ResponseFrame) Frame.fromData((MeshcoreCompanion) this, data);
+		ResponseFrame f;
+		try {
+			f = (ResponseFrame) Frame.fromData((MeshcoreCompanion) this, data);
+		} catch (RuntimeException e) {
+			logReceivedFrame(null, data);
+			throw e;
+		}
+		logReceivedFrame(f, data);
 		dispatchFrame(f);
 	}
 

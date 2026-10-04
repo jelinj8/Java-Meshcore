@@ -1,7 +1,9 @@
 package cz.bliksoft.meshcore.companion;
 
 import java.io.EOFException;
+import java.io.File;
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -126,6 +128,27 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	 * @param deviceAddress BLE MAC address of the MeshCore radio (e.g.
 	 *                      "AA:BB:CC:DD:EE:FF")
 	 */
+	@Override
+	public String getDeviceId() {
+		return deviceAddress;
+	}
+
+	/**
+	 * Besides the frame log, also logs the JSON traffic with the BLE sidecar to
+	 * the same folder - see {@link BleAdapter#setLogDir(Path)}.
+	 */
+	@Override
+	public void setTrafficLogDir(File dir) {
+		super.setTrafficLogDir(dir);
+		BleAdapter a = adapter;
+		if (a != null)
+			a.setLogDir(toPath(dir));
+	}
+
+	private static Path toPath(File dir) {
+		return dir == null ? null : dir.toPath();
+	}
+
 	public BleMeshcoreCompanion(String name, String deviceAddress) {
 		super(name);
 		this.deviceAddress = Objects.requireNonNull(deviceAddress, "deviceAddress");
@@ -300,6 +323,7 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 				throw new IOException("Failed to start BLE sidecar", e);
 			}
 		}
+		newAdapter.setLogDir(toPath(getTrafficLogDir()));
 		this.adapter = newAdapter;
 
 		if (!alreadyScanned) {
@@ -500,6 +524,7 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	 */
 	public static List<String> scanForNusDevices(int timeoutMs) throws IOException {
 		try (BleAdapter adapter = new BleAdapter()) {
+			adapter.setLogDir(toPath(getDefaultTrafficLogDir()));
 			return scanForNusDevices(adapter, timeoutMs);
 		} catch (BleException e) {
 			throw new IOException("Failed to start BLE sidecar", e);
@@ -558,6 +583,7 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 		BleAdapter adapter;
 		try {
 			adapter = new BleAdapter();
+			adapter.setLogDir(toPath(getDefaultTrafficLogDir()));
 		} catch (BleException e) {
 			throw new IOException("Failed to start BLE sidecar", e);
 		}

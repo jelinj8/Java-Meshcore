@@ -32,6 +32,11 @@ public class TCPMeshcoreCompanion extends MeshcoreCompanion {
 	}
 
 	@Override
+	public String getDeviceId() {
+		return host + ":" + port;
+	}
+
+	@Override
 	public boolean isConnected() {
 		Socket s = this.socket;
 		return s != null && !s.isClosed() && s.isConnected();

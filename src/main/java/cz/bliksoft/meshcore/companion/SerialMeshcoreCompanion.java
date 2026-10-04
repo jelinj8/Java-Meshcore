@@ -56,6 +56,11 @@ public class SerialMeshcoreCompanion extends MeshcoreCompanion {
 	}
 
 	@Override
+	public String getDeviceId() {
+		return portName;
+	}
+
+	@Override
 	public boolean isConnected() {
 		SerialPort p = this.port;
 		return p != null && p.isOpen();
