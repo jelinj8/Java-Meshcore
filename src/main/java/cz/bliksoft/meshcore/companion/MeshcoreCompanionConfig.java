@@ -104,9 +104,16 @@ public class MeshcoreCompanionConfig {
 	}
 
 	/**
+	 * Device clock drift (seconds) beyond which {@link #init()} sets the device
+	 * clock to system time - 2 h covers DST.
+	 */
+	public static final long DEVICE_TIME_TOLERANCE_S = 7200;
+
+	/**
 	 * Performs initial device synchronisation: fetches battery/storage info,
-	 * private key, and channels. Called automatically by the companion during
-	 * device initialisation.
+	 * private key, and channels, sets the device clock if it is off by more than
+	 * {@link #DEVICE_TIME_TOLERANCE_S}, then starts the contacts sync. Called
+	 * automatically by the companion during device initialisation.
 	 *
 	 * @throws IOException on transport or synchronisation error
 	 */
@@ -115,10 +122,30 @@ public class MeshcoreCompanionConfig {
 			companion.sendFrameWithResult(new CmdGetBattAndStorage(), 10000);
 			getPrivateKey();
 			syncChannels();
+			syncDeviceTime();
 		} catch (TimeoutException | InterruptedException e) {
 			throw new IOException(e);
 		}
 		syncContacts(true);
+	}
+
+	/**
+	 * Sets the device clock to system time if it is off by more than
+	 * {@link #DEVICE_TIME_TOLERANCE_S}. Done before the contacts sync, never during
+	 * it: a MeshCore nRF52 radio hung (stopped answering until a hard reset) twice
+	 * within 30 ms of a time set arriving while it was streaming contacts. Not
+	 * fatal - a failure is logged.
+	 */
+	private void syncDeviceTime() throws InterruptedException {
+		try {
+			long diff = Math.abs(System.currentTimeMillis() / 1000 - getDeviceTime().getTimestamp());
+			if (diff > DEVICE_TIME_TOLERANCE_S) {
+				setDeviceTime(null);
+				log.info("Device time set (was off by " + diff + " s)");
+			}
+		} catch (IOException | TimeoutException | CompanionErrorException e) {
+			log.log(Level.WARNING, "Failed to check/set device time", e);
+		}
 	}
 
 	/**
