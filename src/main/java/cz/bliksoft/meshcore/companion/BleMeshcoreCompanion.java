@@ -13,6 +13,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import cz.bliksoft.javautils.ble.BleAdapter;
+import cz.bliksoft.javautils.ble.BleBondRejectedException;
 import cz.bliksoft.javautils.ble.BleException;
 import cz.bliksoft.javautils.ble.BlePeripheral;
 import cz.bliksoft.javautils.ble.ConnectionParameterPreset;
@@ -120,6 +121,62 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	// BLE framing.
 	private final LinkedBlockingQueue<byte[]> rxChunks = new LinkedBlockingQueue<>();
 
+	// Re-pairing after the radio rejected the stored bond - see repair(PinProvider).
+	private final Object pairingLock = new Object();
+	private volatile boolean pairingRequired;
+	private volatile PinProvider repairPinProvider;
+	private volatile PairingRequiredListener pairingRequiredListener;
+
+	private volatile String status = "Starting";
+	private volatile StatusListener statusListener;
+
+	/**
+	 * Follows the current step of (re)connecting, for display - see
+	 * {@link BleMeshcoreCompanion#setStatusListener}.
+	 */
+	public interface StatusListener {
+		/** Called on the BLE reader thread. */
+		void onStatus(BleMeshcoreCompanion companion, String status);
+	}
+
+	/**
+	 * Supplies the PIN to pair again with - asked only once the old pairing is
+	 * removed and the radio is found and connected again, right before pairing: a
+	 * radio may show a new PIN by then.
+	 */
+	public interface PinProvider {
+		/**
+		 * Called on the BLE reader thread.
+		 *
+		 * @return the PIN, or {@code null}/blank to cancel pairing (reconnecting then
+		 *         waits as if the bond was rejected again)
+		 */
+		String getPin(BleMeshcoreCompanion companion) throws InterruptedException;
+	}
+
+	/**
+	 * Notified when the radio rejected the stored bond and no PIN to pair again is
+	 * known - see {@link BleMeshcoreCompanion#repair(PinProvider)}.
+	 */
+	public interface PairingRequiredListener {
+		/** Called on the BLE reader thread; reconnecting is paused meanwhile. */
+		void onPairingRequired(BleMeshcoreCompanion companion);
+	}
+
+	/**
+	 * The radio rejected the stored bond - it has lost its own copy, e.g. a reset
+	 * or settings storage wiped on restart (seen on a MeshCore nRF52 radio) - or
+	 * re-pairing was cancelled. See
+	 * {@link BleMeshcoreCompanion#repair(PinProvider)}.
+	 */
+	public static class BondRejectedException extends IOException {
+		private static final long serialVersionUID = 1L;
+
+		BondRejectedException(String message, Throwable cause) {
+			super(message, cause);
+		}
+	}
+
 	/**
 	 * Creates a companion that connects to a MeshCore radio over BLE and
 	 * immediately starts the reader loop.
@@ -206,10 +263,22 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	 *                      or {@code null}/blank to not attempt pairing at all
 	 */
 	public BleMeshcoreCompanion(String name, String deviceAddress, BleAdapter adapter, String pairPin) {
+		this(name, deviceAddress, adapter, pairPin, null);
+	}
+
+	/**
+	 * @param repairPinProvider non-{@code null} to remove the OS-level pairing
+	 *                          first and pair again - see
+	 *                          {@link NusScanResult#repair}; {@code pairPin} is
+	 *                          ignored then
+	 */
+	private BleMeshcoreCompanion(String name, String deviceAddress, BleAdapter adapter, String pairPin,
+			PinProvider repairPinProvider) {
 		super(name);
 		this.deviceAddress = Objects.requireNonNull(deviceAddress, "deviceAddress");
 		this.initialAdapter = Objects.requireNonNull(adapter, "adapter");
 		this.pairPin = pairPin;
+		this.repairPinProvider = repairPinProvider;
 		startLoop();
 	}
 
@@ -275,12 +344,25 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 					onDeviceConnected();
 					runLoop();
 					throw new EOFException("BLE disconnected");
+				} catch (BondRejectedException e) {
+					if (terminate)
+						return;
+					onDeviceDisconnected(e);
+					disconnectBle();
+					try {
+						setStatus("Not paired - waiting for a decision to pair again");
+						awaitRepair();
+					} catch (InterruptedException ie) {
+						Thread.currentThread().interrupt();
+						return;
+					}
 				} catch (Exception e) {
 					if (terminate)
 						return;
 					onDeviceDisconnected(e);
 					disconnectBle();
 					try {
+						setStatus("Connection failed, retrying in " + (backoffMs + 999) / 1000 + " s");
 						Thread.sleep(backoffMs);
 					} catch (InterruptedException ie) {
 						Thread.currentThread().interrupt();
@@ -311,12 +393,24 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 		String pinToUse = pairPin;
 		pairPin = null;
 
+		// Set by repair() - drop the stale bond first, then pair again with the PIN
+		// the provider gives once the radio is connected again.
+		PinProvider repairWith = repairPinProvider;
+		repairPinProvider = null;
+		if (repairWith != null) {
+			pinToUse = null;
+			// Unpairing makes BlueZ forget the device - scan again even on an adapter that
+			// already found it.
+			alreadyScanned = false;
+		}
+
 		if (newAdapter == null) {
 			// Every reconnect attempt gets a fresh sidecar process, so a crashed sidecar
 			// from a
 			// previous attempt is simply retried like any other disconnect — no restart
 			// bookkeeping
 			// needed here.
+			setStatus("Starting Bluetooth");
 			try {
 				newAdapter = new BleAdapter();
 			} catch (BleException e) {
@@ -325,6 +419,17 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 		}
 		newAdapter.setLogDir(toPath(getTrafficLogDir()));
 		this.adapter = newAdapter;
+
+		if (repairWith != null) {
+			// Before the scan: BlueZ forgets an unpaired device, the scan finds it again.
+			setStatus("Removing the old pairing");
+			try {
+				newAdapter.getPeripheral(deviceAddress).unpair();
+				log.info("BLE removed the stale pairing with " + deviceAddress);
+			} catch (BleException e) {
+				throw new IOException("BLE unpair failed for " + deviceAddress, e);
+			}
+		}
 
 		if (!alreadyScanned) {
 			// A scan is required before connect() - some BSToolbox-BLE backends only learn
@@ -342,6 +447,7 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 			// device is unreachable; connect() itself reports the real error if it truly
 			// can't
 			// connect.
+			setStatus("Searching for the radio");
 			try {
 				BleUtils.scan(newAdapter, new ScanFilter().withServiceUuid(NUS_SERVICE).withAddress(deviceAddress),
 						SCAN_TIMEOUT_MS);
@@ -355,7 +461,31 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 				"sidecar_crashed".equals(reason) ? "sidecar" : "peripheral", deviceAddress, reason)));
 
 		try {
-			p.connect();
+			setStatus("Connecting");
+			try {
+				p.connect();
+			} catch (BleBondRejectedException e) {
+				// A PIN given for this very attempt (a device just picked, or repair()) means
+				// the user wants it paired - do that right away, once, instead of asking again.
+				if (repairWith == null && pinToUse != null && !pinToUse.trim().isEmpty()) {
+					String pin = pinToUse;
+					repairPinProvider = c -> pin;
+				}
+				throw new BondRejectedException(
+						deviceAddress + " rejected the stored pairing - it has probably lost it (reset?), pair again",
+						e);
+			}
+			if (repairWith != null) {
+				setStatus("Waiting for the PIN");
+				try {
+					pinToUse = repairWith.getPin(this);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					throw new IOException("Interrupted while waiting for the pairing PIN", e);
+				}
+				if (pinToUse == null || pinToUse.trim().isEmpty())
+					throw new BondRejectedException("Pairing with " + deviceAddress + " cancelled", null);
+			}
 			if (pinToUse != null && !pinToUse.trim().isEmpty()) {
 				// Best-effort, not fatal: an already-paired device (the common case on any
 				// reconnect within this same process, and possible even here if the user
@@ -363,6 +493,7 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 				// succeeding again - that's expected, not a real failure. If the device
 				// genuinely still needs bonding and this didn't establish it, discoverServices/
 				// subscribe below fail instead, surfacing PAIRING_HINT.
+				setStatus("Pairing");
 				try {
 					p.pair(pinToUse);
 					log.info("BLE paired with " + deviceAddress);
@@ -376,11 +507,13 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 			// services if they aren't cached yet right after connecting; without this
 			// explicit call, subscribe() below can fail on a freshly (re)connected
 			// peripheral until something else happens to warm the OS's GATT cache first.
+			setStatus("Discovering services");
 			p.discoverServices();
 		} catch (BleException e) {
 			throw new IOException("BLE connect failed to " + deviceAddress + PAIRING_HINT, e);
 		}
 
+		setStatus("Subscribing");
 		try {
 			p.subscribe(NUS_SERVICE, NUS_RX, (charUuid, data) -> rxChunks.add(data));
 		} catch (BleException e) {
@@ -412,6 +545,7 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 
 	@Override
 	protected void onDeviceConnected() {
+		setStatus("Reading the radio's settings");
 		super.onDeviceConnected();
 		log.info(String.format("BLE connected to %s", deviceAddress));
 		logConnectionDiagnostics();
@@ -497,9 +631,84 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 			log.log(Level.SEVERE, "BLE communication error", cause);
 	}
 
+	/**
+	 * Waits until {@link #repair(PinProvider)} (or {@link #close()}) - unless the
+	 * failed attempt already had a PIN, see {@link #connectBle()}.
+	 */
+	private void awaitRepair() throws InterruptedException {
+		if (repairPinProvider != null)
+			return;
+		pairingRequired = true;
+		PairingRequiredListener l = pairingRequiredListener;
+		if (l != null)
+			l.onPairingRequired(this);
+		synchronized (pairingLock) {
+			while (pairingRequired && !terminate)
+				pairingLock.wait(1000);
+		}
+	}
+
+	/**
+	 * The current step of (re)connecting, e.g. "Searching for the radio" or
+	 * "Pairing" - for display.
+	 */
+	public String getStatus() {
+		return status;
+	}
+
+	/**
+	 * Called whenever {@link #getStatus()} changes. Connecting starts right away in
+	 * the constructor, so read {@link #getStatus()} after setting this to show the
+	 * step already reached.
+	 */
+	public void setStatusListener(StatusListener listener) {
+		this.statusListener = listener;
+	}
+
+	private void setStatus(String status) {
+		this.status = status;
+		StatusListener l = statusListener;
+		if (l != null)
+			l.onStatus(this, status);
+	}
+
+	/**
+	 * Whether the radio rejected the stored bond and reconnecting waits for
+	 * {@link #repair(PinProvider)}.
+	 */
+	public boolean isPairingRequired() {
+		return pairingRequired;
+	}
+
+	/**
+	 * Called when {@link #isPairingRequired()} becomes true, see
+	 * {@link PairingRequiredListener}.
+	 */
+	public void setPairingRequiredListener(PairingRequiredListener listener) {
+		this.pairingRequiredListener = listener;
+	}
+
+	/**
+	 * Resumes reconnecting after the radio rejected the stored bond: removes the
+	 * OS-level pairing, scans, connects and pairs again with the PIN
+	 * {@code pinProvider} gives at that point. Close the companion instead to give
+	 * up.
+	 */
+	public void repair(PinProvider pinProvider) {
+		Objects.requireNonNull(pinProvider, "pinProvider");
+		synchronized (pairingLock) {
+			repairPinProvider = pinProvider;
+			pairingRequired = false;
+			pairingLock.notifyAll();
+		}
+	}
+
 	@Override
 	public void close() {
 		super.close();
+		synchronized (pairingLock) {
+			pairingLock.notifyAll();
+		}
 		disconnectBle();
 	}
 
@@ -643,6 +852,18 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 		public BleMeshcoreCompanion connect(String name, String address, String pairPin) {
 			adopted = true;
 			return new BleMeshcoreCompanion(name, address, adapter, pairPin);
+		}
+
+		/**
+		 * Same as {@link #connect(String, String, String)}, but removes the OS-level
+		 * pairing with {@code address} first, scans, connects and pairs again with
+		 * the PIN {@code pinProvider} gives then - for a radio that lost its own copy
+		 * of the bond (e.g. a reset), which the stored pairing can't reach anymore.
+		 */
+		public BleMeshcoreCompanion repair(String name, String address, PinProvider pinProvider) {
+			adopted = true;
+			return new BleMeshcoreCompanion(name, address, adapter, null,
+					Objects.requireNonNull(pinProvider, "pinProvider"));
 		}
 
 		@Override
