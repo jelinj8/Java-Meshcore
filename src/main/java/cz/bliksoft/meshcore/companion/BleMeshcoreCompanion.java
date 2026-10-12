@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -97,6 +98,16 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	 */
 	public static final String DEFAULT_BLE_PIN = "123456";
 
+	/** See connectBle()'s handling of a refused subscribe. */
+	private static final int BONDED_SUBSCRIBE_FAILURES = 2;
+
+	/**
+	 * Whether pairing can be redone from here - not on macOS, where the OS owns
+	 * bonding and shows its own pairing prompt (no API to supply a PIN or unpair).
+	 */
+	private static final boolean APP_PAIRING = !System.getProperty("os.name", "").toLowerCase(Locale.ROOT)
+			.startsWith("mac");
+
 	private static final String PAIRING_HINT = " — if this device requires bonding and automatic pairing (PIN "
 			+ DEFAULT_BLE_PIN + " unless changed) didn't work, pair it via your OS's own Bluetooth settings instead";
 
@@ -124,6 +135,8 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 	// Re-pairing after the radio rejected the stored bond - see repair(PinProvider).
 	private final Object pairingLock = new Object();
 	private volatile boolean pairingRequired;
+	/** Consecutive refused subscribes despite a stored pairing - see connectBle(). */
+	private int bondedSubscribeFailures;
 	private volatile PinProvider repairPinProvider;
 	private volatile PairingRequiredListener pairingRequiredListener;
 
@@ -165,8 +178,9 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 
 	/**
 	 * The radio rejected the stored bond - it has lost its own copy, e.g. a reset
-	 * or settings storage wiped on restart (seen on a MeshCore nRF52 radio) - or
-	 * re-pairing was cancelled. See
+	 * or settings storage wiped on restart (seen on a MeshCore nRF52 radio), or
+	 * keeps refusing a pairing made without the PIN - or re-pairing was cancelled.
+	 * See
 	 * {@link BleMeshcoreCompanion#repair(PinProvider)}.
 	 */
 	public static class BondRejectedException extends IOException {
@@ -521,10 +535,32 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 				p.disconnect();
 			} catch (BleException ignore) {
 			}
+			// A pairing made without the PIN ("Just Works" - e.g. by the OS's own agent,
+			// or before Linux pairing used the PIN) is kept by the OS, but the radio
+			// requires an authenticated one and refuses the subscription every time
+			// ("Insufficient Authentication") - retrying never helps. Twice in a row,
+			// to let a single dropped link pass.
+			if (APP_PAIRING && (pinToUse == null || pinToUse.trim().isEmpty()) && repairWith == null
+					&& isBondedQuietly(p)
+					&& ++bondedSubscribeFailures >= BONDED_SUBSCRIBE_FAILURES) {
+				bondedSubscribeFailures = 0;
+				throw new BondRejectedException(deviceAddress + " refuses the stored pairing (made without the PIN?)"
+						+ " - pair again", e);
+			}
 			throw new IOException("Failed to subscribe to NUS notifications" + PAIRING_HINT, e);
 		}
+		bondedSubscribeFailures = 0;
 
 		this.peripheral = p;
+	}
+
+	private boolean isBondedQuietly(BlePeripheral p) {
+		try {
+			return p.isBonded();
+		} catch (BleException e) {
+			log.log(Level.FINE, "BLE bond state of " + deviceAddress + " unknown", e);
+			return false;
+		}
 	}
 
 	private void disconnectBle() {
@@ -829,6 +865,20 @@ public class BleMeshcoreCompanion extends MeshcoreCompanion {
 		 */
 		public List<String> getDevices() {
 			return devices;
+		}
+
+		/**
+		 * Whether the OS already holds a pairing (bond) for {@code address} - e.g. to
+		 * ask for a PIN only for a radio not paired yet. {@code false} if that can't
+		 * be told (macOS, where the OS owns bonding, or an error).
+		 */
+		public boolean isPaired(String address) {
+			try {
+				return adapter.getPeripheral(address).isBonded();
+			} catch (BleException e) {
+				log.log(Level.FINE, "BLE bond state of " + address + " unknown", e);
+				return false;
+			}
 		}
 
 		/**
